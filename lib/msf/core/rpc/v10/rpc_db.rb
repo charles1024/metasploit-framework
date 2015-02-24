@@ -4,6 +4,9 @@ module RPC
 class RPC_Db < RPC_Base
 
 private
+
+  include Metasploit::Credential::Creation
+
   def db
     self.framework.db.active
   end
@@ -13,6 +16,21 @@ private
       return self.framework.db.find_workspace(wspace) || error(500, "Invalid workspace")
     end
     self.framework.db.workspace
+  end
+
+  def fix_cred_options(opts)
+    new_opts = fix_options(opts)
+
+    # Convert some of are data back to symbols
+    if new_opts[:origin_type]
+      new_opts[:origin_type] = new_opts[:origin_type].to_sym
+    end
+
+    if new_opts[:private_type]
+      new_opts[:private_type] = new_opts[:private_type].to_sym
+    end
+
+    new_opts
   end
 
   def fix_options(opts)
@@ -37,7 +55,7 @@ private
       return hosts if opts[:addresses].class != Array
       conditions = {}
       conditions[:address] = opts[:addresses]
-      hent = wspace.hosts.all(:conditions => conditions)
+      hent = wspace.hosts.where(conditions)
       hosts |= hent if hent.class == Array
     end
     return hosts
@@ -55,7 +73,7 @@ private
           conditions = {}
           conditions[:port] = opts[:port] if opts[:port]
           conditions[:proto] = opts[:proto] if opts[:proto]
-          sret = h.services.all(:conditions => conditions)
+          sret = h.services.where(conditions)
           next if sret == nil
           services |= sret if sret.class == Array
           services << sret if sret.class == ::Mdm::Service
@@ -67,7 +85,7 @@ private
       conditions = {}
       conditions[:port] = opts[:port] if opts[:port]
       conditions[:proto] = opts[:proto] if opts[:proto]
-      sret = wspace.services.all(:conditions => conditions)
+      sret = wspace.services.where(conditions)
       services |= sret if sret.class == Array
       services << sret if sret.class == ::Mdm::Service
     end
@@ -88,6 +106,76 @@ private
 
 public
 
+  def rpc_create_cracked_credential(xopts)
+    opts = fix_cred_options(xopts)
+    create_credential(opts)
+  end
+
+  def rpc_create_credential(xopts)
+    opts = fix_cred_options(xopts)
+    core = create_credential(opts)
+
+    ret = {
+        username: core.public.try(:username),
+        private: core.private.try(:data),
+        private_type: core.private.try(:type),
+        realm_value: core.realm.try(:value),
+        realm_key: core.realm.try(:key)
+    }
+
+    if opts[:last_attempted_at] && opts[:status]
+      opts[:core] = core
+      opts[:last_attempted_at] = opts[:last_attempted_at].to_datetime
+      login = create_credential_login(opts)
+
+      ret[:host]   = login.service.host.address,
+      ret[:sname]  = login.service.name
+      ret[:status] = login.status
+    end
+    ret
+  end
+
+  def rpc_invalidate_login(xopts)
+    opts = fix_cred_options(xopts)
+    invalidate_login(opts)
+  end
+
+  def rpc_creds(xopts)
+    ::ActiveRecord::Base.connection_pool.with_connection {
+      ret = {}
+      ret[:creds] = []
+      opts, wspace = init_db_opts_workspace(xopts)
+      limit = opts.delete(:limit) || 100
+      offset = opts.delete(:offset) || 0
+      query = Metasploit::Credential::Core.where(
+        workspace_id: wspace
+      ).offset(offset).limit(limit)
+      query.each do |cred|
+        host = ''
+        port = 0
+        proto = ''
+        sname = ''
+        unless cred.logins.empty?
+          login = cred.logins.first
+          host = login.service.host.address.to_s
+          sname = login.service.name.to_s if login.service.name.present?
+          port = login.service.port.to_i
+          proto = login.service.proto.to_s
+        end
+        ret[:creds] << {
+                :user => cred.public.username.to_s,
+                :pass => cred.private.data.to_s,
+                :updated_at => cred.private.updated_at.to_i,
+                :type => cred.private.type.to_s,
+                :host => host,
+                :port => port,
+                :proto => proto,
+                :sname => sname}
+      end
+      ret
+    }
+  end
+
   def rpc_hosts(xopts)
   ::ActiveRecord::Base.connection_pool.with_connection {
     opts, wspace = init_db_opts_workspace(xopts)
@@ -101,8 +189,7 @@ public
 
     ret = {}
     ret[:hosts] = []
-    wspace.hosts.all(:conditions => conditions, :order => :address,
-        :limit => limit, :offset => offset).each do |h|
+    wspace.hosts.where(conditions).offset(offset).order(:address).limit(limit).each do |h|
       host = {}
       host[:created_at] = h.created_at.to_i
       host[:address] = h.address.to_s
@@ -129,7 +216,7 @@ public
     offset = opts.delete(:offset) || 0
 
     conditions = {}
-    conditions[:state] = [ServiceState::Open] if opts[:only_up]
+    conditions[:state] = [Msf::ServiceState::Open] if opts[:only_up]
     conditions[:proto] = opts[:proto] if opts[:proto]
     conditions["hosts.address"] = opts[:addresses] if opts[:addresses]
     conditions[:port] = Rex::Socket.portspec_to_portlist(opts[:ports]) if opts[:ports]
@@ -138,8 +225,7 @@ public
     ret = {}
     ret[:services] = []
 
-    wspace.services.all(:include => :host, :conditions => conditions,
-        :limit => limit, :offset => offset).each do |s|
+    wspace.services.includes(:host).where(conditions).offset(offset).limit(limit).each do |s|
       service = {}
       host = s.host
       service[:host] = host.address || "unknown"
@@ -170,7 +256,7 @@ public
 
     ret = {}
     ret[:vulns] = []
-    wspace.vulns.all(:include => :service, :conditions => conditions, :limit => limit, :offset => offset).each do |v|
+    wspace.vulns.includes(:service).where(conditions).offset(offset).limit(limit).each do |v|
       vuln = {}
       reflist = v.refs.map { |r| r.name }
       if(v.service)
@@ -197,6 +283,7 @@ public
     res[:workspaces] = []
     self.framework.db.workspaces.each do |j|
       ws = {}
+      ws[:id] = j.id
       ws[:name] = j.name
       ws[:created_at] = j.created_at.to_i
       ws[:updated_at] = j.updated_at.to_i
@@ -207,7 +294,7 @@ public
 
   def rpc_current_workspace
     db_check
-    { "workspace" => self.framework.db.workspace.name }
+    { "workspace" => self.framework.db.workspace.name, "workspace_id" => self.framework.db.workspace.id }
   end
 
   def rpc_get_workspace(wspace)
@@ -218,6 +305,7 @@ public
     if(wspace)
       w = {}
       w[:name] = wspace.name
+      w[:id] = wspace.id
       w[:created_at] = wspace.created_at.to_i
       w[:updated_at] = wspace.updated_at.to_i
       ret[:workspace] << w
@@ -329,11 +417,11 @@ public
       sret = host.services.find_by_proto_and_port(opts[:proto], opts[:port])
     elsif(opts[:proto] && opts[:port])
       conditions = {}
-      conditions[:state] = [ServiceState::Open] if opts[:up]
+      conditions[:state] = [Msf::ServiceState::Open] if opts[:up]
       conditions[:proto] = opts[:proto] if opts[:proto]
       conditions[:port] = opts[:port] if opts[:port]
       conditions[:name] = opts[:names] if opts[:names]
-      sret = wspace.services.all(:conditions => conditions, :order => "hosts.address, port")
+      sret = wspace.services.where(conditions).order("hosts.address, port")
     else
       sret = host.services
     end
@@ -474,8 +562,7 @@ public
 
     ret = {}
     ret[:notes] = []
-    wspace.notes.all(:include => [:host, :service], :conditions => conditions,
-        :limit => limit, :offset => offset).each do |n|
+    wspace.notes.includes(:host, :service).where(conditions).offset(offset).limit(limit).each do |n|
       note = {}
       note[:time] = n.created_at.to_i
       note[:host] = ""
@@ -485,33 +572,6 @@ public
       note[:type ] = n.ntype.to_s
       note[:data] = n.data.inspect
       ret[:notes] << note
-    end
-    ret
-  }
-  end
-
-  def rpc_report_auth_info(xopts)
-  ::ActiveRecord::Base.connection_pool.with_connection {
-    opts, wspace = init_db_opts_workspace(xopts)
-    res = self.framework.db.report_auth_info(opts)
-    return { :result => 'success' } if(res)
-    { :result => 'failed' }
-  }
-  end
-
-  def rpc_get_auth_info(xopts)
-  ::ActiveRecord::Base.connection_pool.with_connection {
-    opts, wspace = init_db_opts_workspace(xopts)
-    ret = {}
-    ret[:auth_info] = []
-    # XXX: This method doesn't exist...
-    ai = self.framework.db.get_auth_info(opts)
-    ai.each do |i|
-      info = {}
-      i.each do |k,v|
-        info[k.to_sym] = v
-      end
-      ret[:auth_info] << info
     end
     ret
   }
@@ -674,7 +734,7 @@ public
     elsif opts[:addresses]
       return { :result => 'failed' } if opts[:addresses].class != Array
       conditions = { :address => opts[:addresses] }
-      hent = wspace.hosts.all(:conditions => conditions)
+      hent = wspace.hosts.where(conditions)
       return { :result => 'failed' } if hent == nil
       hosts |= hent if hent.class == Array
       hosts << hent if hent.class == ::Mdm::Host
@@ -686,7 +746,7 @@ public
           conditions = {}
           conditions[:port] = opts[:port] if opts[:port]
           conditions[:proto] = opts[:proto] if opts[:proto]
-          sret = h.services.all(:conditions => conditions)
+          sret = h.services.where(conditions)
           next if sret == nil
           services << sret if sret.class == ::Mdm::Service
           services |= sret if sret.class == Array
@@ -698,7 +758,7 @@ public
       conditions = {}
       conditions[:port] = opts[:port] if opts[:port]
       conditions[:proto] = opts[:proto] if opts[:proto]
-      sret = wspace.services.all(:conditions => conditions)
+      sret = wspace.services.where(conditions)
       services << sret if sret and sret.class == ::Mdm::Service
       services |= sret if sret and sret.class == Array
     end
@@ -731,7 +791,7 @@ public
     elsif opts[:addresses]
       return { :result => 'failed' } if opts[:addresses].class != Array
       conditions = { :address => opts[:addresses] }
-      hent = wspace.hosts.all(:conditions => conditions)
+      hent = wspace.hosts.where(conditions)
       return { :result => 'failed' } if hent == nil
       hosts |= hent if hent.class == Array
       hosts << hent if hent.class == ::Mdm::Host
@@ -766,7 +826,7 @@ public
     ret = {}
     ret[:events] = []
 
-    wspace.events.all(:limit => limit, :offset => offset).each do |e|
+    wspace.events.offset(offset).limit(limit).each do |e|
       event = {}
       event[:host] = e.host.address if(e.host)
       event[:created_at] = e.created_at.to_i
@@ -811,7 +871,7 @@ public
 
     ret = {}
     ret[:loots] = []
-    wspace.loots.all(:limit => limit, :offset => offset).each do |l|
+    wspace.loots.offset(offset).limit(limit).each do |l|
       loot = {}
       loot[:host] = l.host.address if(l.host)
       loot[:service] = l.service.name || l.service.port  if(l.service)
@@ -828,42 +888,6 @@ public
   }
   end
 
-  # requires host, port, user, pass, ptype, and active
-  def rpc_report_cred(xopts)
-  ::ActiveRecord::Base.connection_pool.with_connection {
-    opts, wspace = init_db_opts_workspace(xopts)
-    res = framework.db.find_or_create_cred(opts)
-    return { :result => 'success' } if res
-    { :result => 'failed' }
-  }
-  end
-
-  #right now workspace is the only option supported
-  def rpc_creds(xopts)
-  ::ActiveRecord::Base.connection_pool.with_connection {
-    opts, wspace = init_db_opts_workspace(xopts)
-    limit = opts.delete(:limit) || 100
-    offset = opts.delete(:offset) || 0
-
-    ret = {}
-    ret[:creds] = []
-    ::Mdm::Cred.find(:all, :include => {:service => :host}, :conditions => ["hosts.workspace_id = ?",
-        framework.db.workspace.id ], :limit => limit, :offset => offset).each do |c|
-      cred = {}
-      cred[:host] = c.service.host.address if(c.service.host)
-      cred[:updated_at] = c.updated_at.to_i
-      cred[:port] = c.service.port
-      cred[:proto] = c.service.proto
-      cred[:sname] = c.service.name
-      cred[:type] = c.ptype
-      cred[:user] = c.user
-      cred[:pass] = c.pass
-      cred[:active] = c.active
-      ret[:creds] << cred
-    end
-    ret
-  }
-  end
 
   def rpc_import_data(xopts)
   ::ActiveRecord::Base.connection_pool.with_connection {
@@ -937,8 +961,7 @@ public
     ret = {}
     ret[:clients] = []
 
-    wspace.clients.all(:include => :host, :conditions => conditions,
-        :limit => limit, :offset => offset).each do |c|
+    wspace.clients.includes(:host).where(conditions).offset(offset).limit(limit).each do |c|
       client = {}
       client[:host] = c.host.address.to_s if c.host
       client[:ua_string] = c.ua_string
@@ -972,7 +995,7 @@ public
         conditions = {}
         conditions[:ua_name] = opts[:ua_name] if opts[:ua_name]
         conditions[:ua_ver] = opts[:ua_ver] if opts[:ua_ver]
-        cret = h.clients.all(:conditions => conditions)
+        cret = h.clients.where(conditions)
       else
         cret = h.clients
       end
@@ -1046,7 +1069,7 @@ public
     end
 
     cdb = ""
-    if ::ActiveRecord::Base.connected?
+    if framework.db.connection_established?
       ::ActiveRecord::Base.connection_pool.with_connection { |conn|
         if conn.respond_to? :current_database
           cdb = conn.current_database

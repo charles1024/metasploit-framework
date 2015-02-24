@@ -1,5 +1,5 @@
 ##
-# This module requires Metasploit: http//metasploit.com/download
+# This module requires Metasploit: http://metasploit.com/download
 # Current source: https://github.com/rapid7/metasploit-framework
 ##
 
@@ -13,7 +13,7 @@ class Metasploit3 < Msf::Post
 
   def initialize(info={})
     super( update_info( info,
-        'Name'          => 'Multi Manage Dbvis Add Db Admin',
+        'Name'          => 'Multi Manage DbVisualizer Add Db Admin',
         'Description'   => %q{
            Dbvisulaizer offers a command line functionality to execute SQL pre-configured databases
            (With GUI). The remote database can be accessed from the command line without the need
